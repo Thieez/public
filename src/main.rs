@@ -14,6 +14,12 @@ const ALLOWED_KEYS: &[&str] = &["REPO_URL", "GITHUB_TOKEN", "RUN_COMMAND"];
 struct Config {
     repo_url: String,
     token: String,
+    command: Option<String>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct DetectedRun {
+    directory: PathBuf,
     command: String,
 }
 
@@ -71,7 +77,7 @@ fn parse_env(content: &str) -> Result<Config, String> {
 }
 
 fn config_from_values(values: HashMap<String, String>) -> Result<Config, String> {
-    for key in ["REPO_URL", "GITHUB_TOKEN", "RUN_COMMAND"] {
+    for key in ["REPO_URL", "GITHUB_TOKEN"] {
         if !matches!(values.get(key), Some(value) if !value.trim().is_empty()) {
             return Err(format!("Missing required .env.repo key: {key}"));
         }
@@ -85,9 +91,8 @@ fn config_from_values(values: HashMap<String, String>) -> Result<Config, String>
         .to_owned();
     let command = values
         .get("RUN_COMMAND")
-        .expect("required key checked")
-        .trim()
-        .to_owned();
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty());
 
     if token.chars().any(char::is_whitespace) {
         return Err("GITHUB_TOKEN must not contain whitespace".to_owned());
@@ -97,6 +102,122 @@ fn config_from_values(values: HashMap<String, String>) -> Result<Config, String>
         token,
         command,
     })
+}
+
+fn detect_run_command(checkout: &Path) -> Result<DetectedRun, Box<dyn Error>> {
+    fn scan(directory: &Path, found: &mut Vec<DetectedRun>) -> Result<(), Box<dyn Error>> {
+        let package_path = directory.join("package.json");
+        if package_path.is_file() {
+            let package: Value = serde_json::from_slice(&fs::read(&package_path)?)?;
+            if let Some(scripts) = package.get("scripts").and_then(Value::as_object) {
+                let script = if scripts.contains_key("start") {
+                    Some("start")
+                } else if scripts.contains_key("dev") {
+                    Some("dev")
+                } else {
+                    None
+                };
+                if let Some(script) = script {
+                    let (install, runner) = if directory.join("pnpm-lock.yaml").is_file() {
+                        ("pnpm install --frozen-lockfile", "pnpm")
+                    } else if directory.join("yarn.lock").is_file() {
+                        ("yarn install --frozen-lockfile", "yarn")
+                    } else if directory.join("package-lock.json").is_file()
+                        || directory.join("npm-shrinkwrap.json").is_file()
+                    {
+                        ("npm ci", "npm")
+                    } else {
+                        ("npm install", "npm")
+                    };
+                    found.push(DetectedRun {
+                        directory: directory.to_path_buf(),
+                        command: format!("{install} && {runner} {script}"),
+                    });
+                }
+            }
+        }
+
+        if directory.join("Cargo.toml").is_file() {
+            found.push(DetectedRun {
+                directory: directory.to_path_buf(),
+                command: "cargo run".to_owned(),
+            });
+        }
+        if directory.join("go.mod").is_file() && directory.join("main.go").is_file() {
+            found.push(DetectedRun {
+                directory: directory.to_path_buf(),
+                command: "go run .".to_owned(),
+            });
+        }
+        if directory.join("main.py").is_file() {
+            let install = if directory.join("requirements.txt").is_file() {
+                "python -m pip install -r requirements.txt && "
+            } else {
+                ""
+            };
+            found.push(DetectedRun {
+                directory: directory.to_path_buf(),
+                command: format!("{install}python main.py"),
+            });
+        }
+
+        for entry in fs::read_dir(directory)? {
+            let entry = entry?;
+            if !entry.file_type()?.is_dir() {
+                continue;
+            }
+            let name = entry.file_name();
+            if matches!(
+                name.to_string_lossy().as_ref(),
+                ".git" | ".venv" | "build" | "dist" | "node_modules" | "target" | "vendor"
+            ) {
+                continue;
+            }
+            scan(&entry.path(), found)?;
+        }
+        Ok(())
+    }
+
+    let mut found = Vec::new();
+    scan(checkout, &mut found)?;
+    let root_projects = found
+        .iter()
+        .filter(|candidate| candidate.directory == checkout)
+        .count();
+    if root_projects == 1 {
+        return Ok(found
+            .into_iter()
+            .find(|candidate| candidate.directory == checkout)
+            .expect("one root project was found"));
+    }
+    if root_projects > 1 {
+        found.retain(|candidate| candidate.directory == checkout);
+    }
+    match found.len() {
+        1 => Ok(found.remove(0)),
+        0 => Err(
+            "Could not detect how to run this repository. Set RUN_COMMAND to the project's start command."
+                .into(),
+        ),
+        _ => {
+            let locations = found
+                .iter()
+                .map(|candidate| {
+                    candidate
+                        .directory
+                        .strip_prefix(checkout)
+                        .unwrap_or(&candidate.directory)
+                        .display()
+                        .to_string()
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            Err(format!(
+                "Multiple runnable projects were found ({locations}). Set RUN_COMMAND to choose one."
+            )
+            .into())
+        }
+    }
 }
 
 fn config_from_environment() -> Result<Config, String> {
@@ -407,12 +528,20 @@ fn run_with_temp(
         None,
     )?;
 
-    println!("Running the private repository...");
+    let run = match &config.command {
+        Some(command) => DetectedRun {
+            directory: checkout_path.clone(),
+            command: command.clone(),
+        },
+        None => detect_run_command(&checkout_path)?,
+    };
+
+    println!("Running the private repository with: {}", run.command);
     #[cfg(windows)]
-    let (program, args) = ("cmd", vec!["/C".to_owned(), config.command.clone()]);
+    let (program, args) = ("cmd", vec!["/C".to_owned(), run.command]);
     #[cfg(not(windows))]
-    let (program, args) = ("/bin/sh", vec!["-lc".to_owned(), config.command.clone()]);
-    run_process(program, args, Some(runtime_env), Some(&checkout_path))?;
+    let (program, args) = ("/bin/sh", vec!["-lc".to_owned(), run.command]);
+    run_process(program, args, Some(runtime_env), Some(&run.directory))?;
     Ok(())
 }
 
@@ -437,7 +566,7 @@ mod tests {
             Config {
                 repo_url: "https://github.com/acme/private.git".to_owned(),
                 token: "ghp_example123".to_owned(),
-                command: "npm start".to_owned(),
+                command: Some("npm start".to_owned()),
             }
         );
     }
@@ -457,9 +586,17 @@ mod tests {
             Config {
                 repo_url: "https://github.com/acme/private.git".to_owned(),
                 token: "ghp_token".to_owned(),
-                command: "npm start".to_owned(),
+                command: Some("npm start".to_owned()),
             }
         );
+        let values = HashMap::from([
+            (
+                "REPO_URL".to_owned(),
+                "https://github.com/acme/private".to_owned(),
+            ),
+            ("GITHUB_TOKEN".to_owned(), "ghp_token".to_owned()),
+        ]);
+        assert_eq!(config_from_values(values).unwrap().command, None);
     }
 
     #[test]
@@ -493,11 +630,9 @@ mod tests {
         assert!(parse_env("TOKEN=secret")
             .unwrap_err()
             .contains("Unsupported"));
-        assert!(
-            parse_env("REPO_URL=https://github.com/acme/private\nGITHUB_TOKEN=secret")
-                .unwrap_err()
-                .contains("RUN_COMMAND")
-        );
+        let config =
+            parse_env("REPO_URL=https://github.com/acme/private\nGITHUB_TOKEN=secret").unwrap();
+        assert_eq!(config.command, None);
     }
 
     #[test]
@@ -525,5 +660,42 @@ mod tests {
         assert!(is_runner_or_git_variable("GITHUB_TOKEN"));
         assert!(is_runner_or_git_variable("GIT_CONFIG_VALUE_0"));
         assert!(!is_runner_or_git_variable("PORT"));
+    }
+
+    #[test]
+    fn detects_node_project_and_installs_its_dependencies() {
+        let directory = create_temp_root().unwrap();
+        fs::write(
+            directory.join("package.json"),
+            r#"{"scripts":{"start":"node server.js"}}"#,
+        )
+        .unwrap();
+        fs::write(directory.join("package-lock.json"), "{}").unwrap();
+
+        let run = detect_run_command(&directory).unwrap();
+        assert_eq!(run.directory, directory);
+        assert_eq!(run.command, "npm ci && npm start");
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn detects_a_nested_project_and_rejects_ambiguous_projects() {
+        let directory = create_temp_root().unwrap();
+        let nested = directory.join("service");
+        fs::create_dir(&nested).unwrap();
+        fs::write(nested.join("Cargo.toml"), "[package]").unwrap();
+
+        let run = detect_run_command(&directory).unwrap();
+        assert_eq!(run.directory, nested);
+        assert_eq!(run.command, "cargo run");
+
+        let other = directory.join("other");
+        fs::create_dir(&other).unwrap();
+        fs::write(other.join("main.py"), "print('hello')").unwrap();
+        assert!(detect_run_command(&directory)
+            .unwrap_err()
+            .to_string()
+            .contains("Multiple runnable projects"));
+        fs::remove_dir_all(directory).unwrap();
     }
 }
