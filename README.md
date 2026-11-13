@@ -1,31 +1,41 @@
 # Private repository runner
 
-Clone a private GitHub repository with a personal access token, then run a
-configured command inside a temporary Docker container.
+Clone a private GitHub repository with a personal access token, then run its
+configured start command directly from a temporary checkout.
 
-## Setup
+## Run locally
 
-1. Copy `.env.repo.example` to `.env.repo`.
-2. Set `REPO_URL` to an HTTPS GitHub repository URL and `GITHUB_TOKEN` to a
-   token with read-only access to that repository.
-3. Set `DOCKER_IMAGE` and `RUN_COMMAND` for the repository's language and
-   start command.
-4. Run `npm start` from this project directory. Docker and Git must be
-   installed.
+Copy `.env.repo.example` to `.env.repo`, then set:
 
-For example, use `node:22-alpine` with `npm start` for a Node.js project, or
-`python:3.12-slim` with `python main.py` for a Python project.
+- `REPO_URL`: HTTPS URL of the private GitHub repository.
+- `GITHUB_TOKEN`: a narrowly scoped, read-only GitHub token.
+- `RUN_COMMAND`: the command that starts the private project.
 
-Each run uses a fresh temporary checkout, removed when the command exits. The
-token is used only by Git during cloning and is not passed to the container.
-If a `.env` file is present beside `.env.repo`, its variables are passed to the
-container as the private repository's environment; the file itself is not
-copied into the checkout.
-The container has no network access, receives only the checkout, and runs with
-resource limits and reduced privileges. This limits exposure but is not a
-perfect security boundary; run code only from repositories you trust. Never
-commit `.env.repo`, and use a narrowly scoped token.
+Run `cargo run`. Git and the runtime required by the private project must be
+installed. An optional `.env` beside `.env.repo` supplies variables to the
+private project.
+
+## Deploy on Render
+
+Create a Render Web Service from this public repository. Set the build command
+to `cargo build --release` and the start command to
+`./target/release/private-repository-runner`. Add `REPO_URL`, `GITHUB_TOKEN`,
+and `RUN_COMMAND` in the service's environment settings, along with any
+environment variables required by the private project. Set `RUN_COMMAND` to
+whatever installs/builds and starts that project (for example,
+`npm install && npm start`). The private project's web server must listen on
+`0.0.0.0` and the port provided by Render's `PORT` variable.
+
+The runner clones the repository on each start into a temporary directory,
+runs the command there, and deletes the checkout when it exits. Runner settings
+can also be supplied via `.env.repo`; if that file exists, it takes precedence
+over runner settings in the process environment.
+
+The private project runs directly with the runner's OS user privileges and
+network access; it is not sandboxed. Only run code from a repository you trust.
+The GitHub token and Git authentication variables are withheld from the
+project process. Never commit `.env.repo`; keep the token narrowly scoped.
 
 ## Test
 
-Run `npm test` to execute the configuration and sandbox-option tests.
+Run `cargo test` to execute the configuration and environment tests.
