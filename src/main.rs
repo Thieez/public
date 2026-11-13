@@ -540,7 +540,7 @@ fn run_with_temp(
     #[cfg(windows)]
     let (program, args) = ("cmd", vec!["/C".to_owned(), run.command]);
     #[cfg(not(windows))]
-    let (program, args) = ("/bin/sh", vec!["-lc".to_owned(), run.command]);
+    let (program, args) = ("/bin/sh", vec!["-c".to_owned(), run.command]);
     run_process(program, args, Some(runtime_env), Some(&run.directory))?;
     Ok(())
 }
