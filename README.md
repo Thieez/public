@@ -46,7 +46,13 @@ set to override automatic detection; `RUN_DIRECTORY` selects the working
 directory inside the cloned repository when needed. The private project's web
 server must listen on `0.0.0.0` and the port provided by Render's `PORT`
 variable. The runner also adds `$HOME/.local/bin` to the private project's
-`PATH`, so tools installed there can be launched normally.
+`PATH`, so tools installed there can be launched normally. For automatically
+detected Rust projects, it caches Cargo build artifacts under
+`$HOME/.cache/private-repository-runner/<owner>/<repo>` and disables dev debug
+symbols to reduce build time and disk usage. The first cold build still has to
+compile dependencies; subsequent restarts can reuse the cache when the
+filesystem is retained. An explicitly configured `CARGO_TARGET_DIR` is
+respected.
 
 The runner clones the repository on each start into a temporary directory,
 runs the command there, and deletes the checkout when it exits. Runner settings

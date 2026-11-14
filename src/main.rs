@@ -486,6 +486,45 @@ fn build_runtime_env(extra: HashMap<String, String>) -> Result<HashMap<String, S
     Ok(values)
 }
 
+fn configure_cargo_cache(
+    values: &mut HashMap<String, String>,
+    repository_url: &str,
+) -> Result<(), String> {
+    values
+        .entry("CARGO_PROFILE_DEV_DEBUG".to_owned())
+        .or_insert_with(|| "0".to_owned());
+
+    if values.contains_key("CARGO_TARGET_DIR") {
+        return Ok(());
+    }
+
+    let Some(home) = values.get("HOME") else {
+        return Ok(());
+    };
+    let repository = repository_url
+        .strip_prefix("https://github.com/")
+        .and_then(|path| path.strip_suffix(".git"))
+        .ok_or_else(|| "Could not derive a Cargo cache location from REPO_URL".to_owned())?;
+    let mut parts = repository.split('/');
+    let owner = parts.next().unwrap_or_default();
+    let name = parts.next().unwrap_or_default();
+    if parts.next().is_some() || !valid_repo_part(owner) || !valid_repo_part(name) {
+        return Err("Could not derive a Cargo cache location from REPO_URL".to_owned());
+    }
+
+    let target_dir = PathBuf::from(home)
+        .join(".cache")
+        .join("private-repository-runner")
+        .join(owner)
+        .join(name)
+        .join("cargo-target");
+    values.insert(
+        "CARGO_TARGET_DIR".to_owned(),
+        target_dir.to_string_lossy().into_owned(),
+    );
+    Ok(())
+}
+
 fn find_env_file(directory: &Path) -> Result<Option<PathBuf>, Box<dyn Error>> {
     let path = directory.join(".env");
     match fs::metadata(&path) {
@@ -615,6 +654,7 @@ fn run_with_temp(
 
     let configured_directory =
         resolve_run_directory(&checkout_path, config.run_directory.as_deref())?;
+    let auto_detected = config.command.is_none();
     let run = match &config.command {
         Some(command) => DetectedRun {
             directory: if config.run_directory.is_some() {
@@ -640,11 +680,16 @@ fn run_with_temp(
         },
         run.command
     );
+    let is_detected_cargo_project = auto_detected && run.command == "cargo run";
     #[cfg(windows)]
     let (program, args) = ("cmd", vec!["/C".to_owned(), run.command]);
     #[cfg(not(windows))]
     let (program, args) = ("/bin/sh", vec!["-c".to_owned(), run.command]);
-    run_process(program, args, Some(runtime_env), Some(&run.directory))?;
+    let mut run_env = runtime_env.clone();
+    if is_detected_cargo_project {
+        configure_cargo_cache(&mut run_env, &config.repo_url)?;
+    }
+    run_process(program, args, Some(&run_env), Some(&run.directory))?;
     Ok(())
 }
 
@@ -801,6 +846,35 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn configures_persistent_cargo_cache_without_overriding_user_settings() {
+        let home = PathBuf::from("home");
+        let mut values = HashMap::from([("HOME".to_owned(), home.display().to_string())]);
+        configure_cargo_cache(&mut values, "https://github.com/acme/pancake.git").unwrap();
+
+        assert_eq!(values["CARGO_PROFILE_DEV_DEBUG"], "0");
+        assert_eq!(
+            PathBuf::from(&values["CARGO_TARGET_DIR"]),
+            home.join(".cache")
+                .join("private-repository-runner")
+                .join("acme")
+                .join("pancake")
+                .join("cargo-target")
+        );
+
+        values.insert("CARGO_PROFILE_DEV_DEBUG".to_owned(), "2".to_owned());
+        values.insert("CARGO_TARGET_DIR".to_owned(), "custom-target".to_owned());
+        configure_cargo_cache(&mut values, "https://github.com/acme/pancake.git").unwrap();
+        assert_eq!(values["CARGO_PROFILE_DEV_DEBUG"], "2");
+        assert_eq!(values["CARGO_TARGET_DIR"], "custom-target");
+    }
+
+    #[test]
+    fn rejects_invalid_repository_urls_for_cargo_cache() {
+        let mut values = HashMap::from([("HOME".to_owned(), "home".to_owned())]);
+        assert!(configure_cargo_cache(&mut values, "https://github.com/../outside.git").is_err());
     }
 
     #[test]
