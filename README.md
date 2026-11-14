@@ -36,13 +36,17 @@ working directory.
 
 Create a Render Web Service from this public repository. Set the build command
 to `cargo build --release` and the start command to
-`./target/release/private-repository-runner`. Add `REPO_URL` and
+`./target/release/private-repository-runner`. Pancake installs the Copilot CLI
+automatically on Linux/macOS when it starts; no custom Render install command
+is needed. The service must allow outbound HTTPS to `gh.io` and GitHub, and
+have `bash` and `curl` available. Add `REPO_URL` and
 `GITHUB_TOKEN` in the service's environment settings, along with any
 environment variables required by the private project. `RUN_COMMAND` can be
 set to override automatic detection; `RUN_DIRECTORY` selects the working
 directory inside the cloned repository when needed. The private project's web
 server must listen on `0.0.0.0` and the port provided by Render's `PORT`
-variable.
+variable. The runner also adds `$HOME/.local/bin` to the private project's
+`PATH`, so tools installed there can be launched normally.
 
 The runner clones the repository on each start into a temporary directory,
 runs the command there, and deletes the checkout when it exits. Runner settings

@@ -458,7 +458,22 @@ fn is_runner_or_git_variable(key: &str) -> bool {
         )
 }
 
-fn build_runtime_env(extra: HashMap<String, String>) -> HashMap<String, String> {
+fn add_user_local_bin_to_path(values: &mut HashMap<String, String>) -> Result<(), String> {
+    let (Some(home), Some(path)) = (values.get("HOME"), values.get("PATH")) else {
+        return Ok(());
+    };
+    let local_bin = PathBuf::from(home).join(".local").join("bin");
+    let mut paths = env::split_paths(OsStr::new(path)).collect::<Vec<_>>();
+    if !paths.contains(&local_bin) {
+        paths.insert(0, local_bin);
+        let path = env::join_paths(paths)
+            .map_err(|error| format!("Could not update the private project PATH: {error}"))?;
+        values.insert("PATH".to_owned(), path.to_string_lossy().into_owned());
+    }
+    Ok(())
+}
+
+fn build_runtime_env(extra: HashMap<String, String>) -> Result<HashMap<String, String>, String> {
     let mut values: HashMap<String, String> = env::vars()
         .filter(|(key, _)| !is_runner_or_git_variable(key))
         .collect();
@@ -467,7 +482,8 @@ fn build_runtime_env(extra: HashMap<String, String>) -> HashMap<String, String> 
             values.insert(key, value);
         }
     }
-    values
+    add_user_local_bin_to_path(&mut values)?;
+    Ok(values)
 }
 
 fn find_env_file(directory: &Path) -> Result<Option<PathBuf>, Box<dyn Error>> {
@@ -551,7 +567,7 @@ fn run() -> Result<(), Box<dyn Error>> {
         Some(path) => parse_runtime_env(&fs::read_to_string(path)?)?,
         None => HashMap::new(),
     };
-    let runtime_env = build_runtime_env(extra_env);
+    let runtime_env = build_runtime_env(extra_env)?;
     let temp_root = create_temp_root()?;
     let result = run_with_temp(&config, &temp_root, &runtime_env);
     let cleanup = fs::remove_dir_all(&temp_root);
@@ -756,6 +772,35 @@ mod tests {
         assert!(is_runner_or_git_variable("GIT_CONFIG_VALUE_0"));
         assert!(is_runner_or_git_variable("RUN_DIRECTORY"));
         assert!(!is_runner_or_git_variable("PORT"));
+    }
+
+    #[test]
+    fn adds_user_local_bin_to_target_path_once() {
+        let system_path = env::join_paths([PathBuf::from("system-bin")]).unwrap();
+        let mut values = HashMap::from([
+            (
+                "HOME".to_owned(),
+                PathBuf::from("home").display().to_string(),
+            ),
+            (
+                "PATH".to_owned(),
+                system_path.to_string_lossy().into_owned(),
+            ),
+        ]);
+        add_user_local_bin_to_path(&mut values).unwrap();
+        let paths = env::split_paths(OsStr::new(&values["PATH"])).collect::<Vec<_>>();
+        assert_eq!(paths[0], PathBuf::from("home").join(".local").join("bin"));
+        assert!(paths.contains(&PathBuf::from("system-bin")));
+
+        add_user_local_bin_to_path(&mut values).unwrap();
+        let paths = env::split_paths(OsStr::new(&values["PATH"])).collect::<Vec<_>>();
+        assert_eq!(
+            paths
+                .iter()
+                .filter(|path| **path == PathBuf::from("home").join(".local").join("bin"))
+                .count(),
+            1
+        );
     }
 
     #[test]
