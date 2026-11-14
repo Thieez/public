@@ -8,13 +8,14 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-const ALLOWED_KEYS: &[&str] = &["REPO_URL", "GITHUB_TOKEN", "RUN_COMMAND"];
+const ALLOWED_KEYS: &[&str] = &["REPO_URL", "GITHUB_TOKEN", "RUN_COMMAND", "RUN_DIRECTORY"];
 
 #[derive(Debug, PartialEq, Eq)]
 struct Config {
     repo_url: String,
     token: String,
     command: Option<String>,
+    run_directory: Option<PathBuf>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -93,6 +94,12 @@ fn config_from_values(values: HashMap<String, String>) -> Result<Config, String>
         .get("RUN_COMMAND")
         .map(|value| value.trim().to_owned())
         .filter(|value| !value.is_empty());
+    let run_directory = values
+        .get("RUN_DIRECTORY")
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+        .map(parse_run_directory)
+        .transpose()?;
 
     if token.chars().any(char::is_whitespace) {
         return Err("GITHUB_TOKEN must not contain whitespace".to_owned());
@@ -101,10 +108,25 @@ fn config_from_values(values: HashMap<String, String>) -> Result<Config, String>
         repo_url,
         token,
         command,
+        run_directory,
     })
 }
 
-fn detect_run_command(checkout: &Path) -> Result<DetectedRun, Box<dyn Error>> {
+fn parse_run_directory(value: &str) -> Result<PathBuf, String> {
+    let normalized = value.replace('\\', "/");
+    if normalized.starts_with('/')
+        || normalized.as_bytes().get(1) == Some(&b':')
+        || normalized.split('/').any(|part| part == "..")
+        || normalized.contains(['\0', '\r', '\n'])
+    {
+        return Err(
+            "RUN_DIRECTORY must be a relative path inside the cloned repository".to_owned(),
+        );
+    }
+    Ok(PathBuf::from(normalized))
+}
+
+fn scan_runnable_projects(checkout: &Path) -> Result<Vec<DetectedRun>, Box<dyn Error>> {
     fn scan(directory: &Path, found: &mut Vec<DetectedRun>) -> Result<(), Box<dyn Error>> {
         let package_path = directory.join("package.json");
         if package_path.is_file() {
@@ -180,6 +202,11 @@ fn detect_run_command(checkout: &Path) -> Result<DetectedRun, Box<dyn Error>> {
 
     let mut found = Vec::new();
     scan(checkout, &mut found)?;
+    Ok(found)
+}
+
+fn detect_run_command(checkout: &Path) -> Result<DetectedRun, Box<dyn Error>> {
+    let mut found = scan_runnable_projects(checkout)?;
     let root_projects = found
         .iter()
         .filter(|candidate| candidate.directory == checkout)
@@ -220,8 +247,50 @@ fn detect_run_command(checkout: &Path) -> Result<DetectedRun, Box<dyn Error>> {
     }
 }
 
+fn detect_command_directory(checkout: &Path) -> Result<PathBuf, Box<dyn Error>> {
+    let projects = scan_runnable_projects(checkout)?;
+    if projects
+        .iter()
+        .any(|candidate| candidate.directory == checkout)
+    {
+        return Ok(checkout.to_path_buf());
+    }
+
+    let mut directories = projects
+        .into_iter()
+        .map(|project| project.directory)
+        .collect::<Vec<_>>();
+    directories.sort();
+    directories.dedup();
+    match directories.as_slice() {
+        [] => Ok(checkout.to_path_buf()),
+        [directory] => Ok(directory.clone()),
+        _ => Err(
+            "Multiple runnable projects were found. Set RUN_DIRECTORY to choose where RUN_COMMAND should run."
+                .into(),
+        ),
+    }
+}
+
+fn resolve_run_directory(
+    checkout: &Path,
+    configured: Option<&Path>,
+) -> Result<PathBuf, Box<dyn Error>> {
+    let checkout = fs::canonicalize(checkout)?;
+    let Some(configured) = configured else {
+        return Ok(checkout);
+    };
+    let directory = fs::canonicalize(checkout.join(configured))?;
+    if !directory.starts_with(&checkout) || !directory.is_dir() {
+        return Err(
+            "RUN_DIRECTORY must resolve to a directory inside the cloned repository".into(),
+        );
+    }
+    Ok(directory)
+}
+
 fn config_from_environment() -> Result<Config, String> {
-    let values = ["REPO_URL", "GITHUB_TOKEN", "RUN_COMMAND"]
+    let values = ["REPO_URL", "GITHUB_TOKEN", "RUN_COMMAND", "RUN_DIRECTORY"]
         .into_iter()
         .filter_map(|key| env::var(key).ok().map(|value| (key.to_owned(), value)))
         .collect();
@@ -385,7 +454,7 @@ fn is_runner_or_git_variable(key: &str) -> bool {
     key.starts_with("GIT_")
         || matches!(
             key.as_str(),
-            "GITHUB_TOKEN" | "GH_TOKEN" | "REPO_URL" | "RUN_COMMAND"
+            "GITHUB_TOKEN" | "GH_TOKEN" | "REPO_URL" | "RUN_COMMAND" | "RUN_DIRECTORY"
         )
 }
 
@@ -528,15 +597,33 @@ fn run_with_temp(
         None,
     )?;
 
+    let configured_directory =
+        resolve_run_directory(&checkout_path, config.run_directory.as_deref())?;
     let run = match &config.command {
         Some(command) => DetectedRun {
-            directory: checkout_path.clone(),
+            directory: if config.run_directory.is_some() {
+                configured_directory
+            } else {
+                detect_command_directory(&checkout_path)?
+            },
             command: command.clone(),
         },
-        None => detect_run_command(&checkout_path)?,
+        None => detect_run_command(&configured_directory)?,
     };
 
-    println!("Running the private repository with: {}", run.command);
+    let relative_directory = run
+        .directory
+        .strip_prefix(&checkout_path)
+        .unwrap_or(&run.directory);
+    println!(
+        "Running the private repository from {} with: {}",
+        if relative_directory.as_os_str().is_empty() {
+            ".".to_owned()
+        } else {
+            relative_directory.display().to_string()
+        },
+        run.command
+    );
     #[cfg(windows)]
     let (program, args) = ("cmd", vec!["/C".to_owned(), run.command]);
     #[cfg(not(windows))]
@@ -560,13 +647,14 @@ mod tests {
     fn parses_runner_configuration() {
         assert_eq!(
             parse_env(
-                "# Private repository\nREPO_URL=https://github.com/acme/private.git\nGITHUB_TOKEN=ghp_example123\nRUN_COMMAND=\"npm start\""
+                "# Private repository\nREPO_URL=https://github.com/acme/private.git\nGITHUB_TOKEN=ghp_example123\nRUN_COMMAND=\"npm start\"\nRUN_DIRECTORY=server"
             )
             .unwrap(),
             Config {
                 repo_url: "https://github.com/acme/private.git".to_owned(),
                 token: "ghp_example123".to_owned(),
                 command: Some("npm start".to_owned()),
+                run_directory: Some(PathBuf::from("server")),
             }
         );
     }
@@ -580,6 +668,7 @@ mod tests {
             ),
             ("GITHUB_TOKEN".to_owned(), "ghp_token".to_owned()),
             ("RUN_COMMAND".to_owned(), "npm start".to_owned()),
+            ("RUN_DIRECTORY".to_owned(), "server".to_owned()),
         ]);
         assert_eq!(
             config_from_values(values).unwrap(),
@@ -587,6 +676,7 @@ mod tests {
                 repo_url: "https://github.com/acme/private.git".to_owned(),
                 token: "ghp_token".to_owned(),
                 command: Some("npm start".to_owned()),
+                run_directory: Some(PathBuf::from("server")),
             }
         );
         let values = HashMap::from([
@@ -630,9 +720,14 @@ mod tests {
         assert!(parse_env("TOKEN=secret")
             .unwrap_err()
             .contains("Unsupported"));
+        assert!(parse_env(
+            "REPO_URL=https://github.com/acme/private\nGITHUB_TOKEN=secret\nRUN_DIRECTORY=../outside"
+        )
+        .is_err());
         let config =
             parse_env("REPO_URL=https://github.com/acme/private\nGITHUB_TOKEN=secret").unwrap();
         assert_eq!(config.command, None);
+        assert_eq!(config.run_directory, None);
     }
 
     #[test]
@@ -659,6 +754,7 @@ mod tests {
         assert!(parse_runtime_env("invalid").is_err());
         assert!(is_runner_or_git_variable("GITHUB_TOKEN"));
         assert!(is_runner_or_git_variable("GIT_CONFIG_VALUE_0"));
+        assert!(is_runner_or_git_variable("RUN_DIRECTORY"));
         assert!(!is_runner_or_git_variable("PORT"));
     }
 
@@ -688,6 +784,11 @@ mod tests {
         let run = detect_run_command(&directory).unwrap();
         assert_eq!(run.directory, nested);
         assert_eq!(run.command, "cargo run");
+        assert_eq!(detect_command_directory(&directory).unwrap(), nested);
+        assert_eq!(
+            resolve_run_directory(&directory, Some(Path::new("service"))).unwrap(),
+            fs::canonicalize(&nested).unwrap()
+        );
 
         let other = directory.join("other");
         fs::create_dir(&other).unwrap();
@@ -696,6 +797,25 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("Multiple runnable projects"));
+        assert!(detect_command_directory(&directory)
+            .unwrap_err()
+            .to_string()
+            .contains("Set RUN_DIRECTORY"));
         fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn run_directory_must_be_relative_and_stay_inside_the_checkout() {
+        assert_eq!(
+            parse_run_directory("server").unwrap(),
+            PathBuf::from("server")
+        );
+        assert_eq!(
+            parse_run_directory(r"server\src").unwrap(),
+            PathBuf::from("server/src")
+        );
+        for path in ["../outside", "/absolute", r"C:\outside", r"\\server\share"] {
+            assert!(parse_run_directory(path).is_err(), "accepted {path}");
+        }
     }
 }

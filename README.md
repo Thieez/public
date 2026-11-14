@@ -11,15 +11,26 @@ Copy `.env.repo.example` to `.env.repo`, then set:
 - `GITHUB_TOKEN`: a narrowly scoped, read-only GitHub token.
 - `RUN_COMMAND`: optional command override. If omitted, the runner detects a
   runnable project and starts it automatically.
+- `RUN_DIRECTORY`: optional path relative to the cloned repository. Use it
+  when the repository contains multiple projects or when an override should
+  run from a specific subdirectory.
 
 Run `cargo run`. Git and the runtime required by the private project must be
 installed. Automatic detection supports Node.js projects with a `start` or
 `dev` script, Rust projects with `Cargo.toml`, Go projects with `go.mod` and
 `main.go`, and Python projects with `main.py`. Node dependencies are installed
 using the detected package manager and Python dependencies are installed from
-`requirements.txt` when present. If multiple runnable projects are found, set
-`RUN_COMMAND` explicitly. An optional `.env` beside `.env.repo` supplies
-variables to the private project.
+`requirements.txt` when present. Detection runs against the cloned repository,
+not the runner's working directory. When it finds a project in a subdirectory,
+the runner starts the command from that directory. An explicit `RUN_COMMAND`
+also uses the detected project directory; if there are multiple candidate
+directories, set `RUN_DIRECTORY` to select one. An optional `.env` beside
+`.env.repo` supplies variables to the private project.
+
+For example, for a Rust service whose `Cargo.toml` is in `server/`, automatic
+detection runs `cargo run` from `server/`. To override the command explicitly,
+set `RUN_COMMAND=cargo run --release`; the runner still uses `server/` as its
+working directory.
 
 ## Deploy on Render
 
@@ -28,8 +39,10 @@ to `cargo build --release` and the start command to
 `./target/release/private-repository-runner`. Add `REPO_URL` and
 `GITHUB_TOKEN` in the service's environment settings, along with any
 environment variables required by the private project. `RUN_COMMAND` can be
-set to override automatic detection. The private project's web server must
-listen on `0.0.0.0` and the port provided by Render's `PORT` variable.
+set to override automatic detection; `RUN_DIRECTORY` selects the working
+directory inside the cloned repository when needed. The private project's web
+server must listen on `0.0.0.0` and the port provided by Render's `PORT`
+variable.
 
 The runner clones the repository on each start into a temporary directory,
 runs the command there, and deletes the checkout when it exits. Runner settings
